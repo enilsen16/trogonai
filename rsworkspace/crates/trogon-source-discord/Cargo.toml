@@ -29,3 +29,6 @@ tower = "0.5"
 tracing-subscriber = { workspace = true }
 trogon-nats = { workspace = true, features = ["test-support"] }
 trogon-std = { workspace = true, features = ["test-support"] }
+testcontainers-modules = { version = "0.8", features = ["nats"] }
+futures-util = { workspace = true }
+ed25519-dalek = { version = "2.1", features = ["std"] }

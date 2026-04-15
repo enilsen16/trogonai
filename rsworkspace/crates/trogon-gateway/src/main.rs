@@ -62,7 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("trogon-gateway starting");
 
     let nats = connect(&resolved.nats, NATS_CONNECT_TIMEOUT).await?;
-    let max_payload = MaxPayload::from_server_limit(nats.server_info().max_payload);
+    // Read max_payload from server info; fall back to the NATS default (1 MiB)
+    // if the value is zero, which can happen when `retry_on_initial_connect`
+    // returns the Client before the INFO handshake has fully propagated.
+    let server_max = nats.server_info().max_payload;
+    let max_payload = MaxPayload::from_server_limit(if server_max > 0 { server_max } else { 1024 * 1024 });
     let js_context = async_nats::jetstream::new(nats.clone());
     let object_store = NatsObjectStore::provision(
         &js_context,
