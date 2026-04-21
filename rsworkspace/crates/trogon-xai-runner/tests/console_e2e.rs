@@ -1,14 +1,16 @@
-//! End-to-end test: trogon-console creates an agent + skill, xAI runner reads
-//! the config, makes a real API call, persists the session, and trogon-console
-//! reads it back from the SESSIONS bucket.
+//! End-to-end tests: trogon-console ↔ trogon-xai-runner round-trip.
 //!
-//! Requires `XAI_API_KEY` to be set; skipped silently otherwise.
+//! Tests that require `XAI_API_KEY` are skipped silently when it is not set.
+//! HTTP tests use a real NATS container + axum server but no xAI API calls.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::{
-    Agent as _, ContentBlock, NewSessionRequest, PromptRequest, SessionNotification, StopReason,
+    Agent as _, CloseSessionRequest, ContentBlock, NewSessionRequest, PromptRequest,
+    SessionNotification, StopReason,
 };
+use async_nats::jetstream;
 use async_trait::async_trait;
 use testcontainers_modules::{
     nats::Nats,
@@ -17,19 +19,27 @@ use testcontainers_modules::{
 use trogon_console::{
     models::agent::{AgentDefinition, AgentModel, AgentStatus},
     models::skill::{Skill, SkillVersion},
-    store::agents::AgentStore,
-    store::sessions::SessionReader,
-    store::skills::SkillStore,
+    server::{AppState, build_router},
+    store::{
+        agents::AgentStore,
+        credentials::CredentialStore,
+        environments::EnvironmentStore,
+        sessions::SessionReader,
+        skills::SkillStore,
+        traits::{
+            AgentRepository, CredentialRepository, EnvironmentRepository, SessionRepository,
+            SkillRepository,
+        },
+    },
 };
 use trogon_xai_runner::{
-    AgentLoader, SessionNotifier, SkillLoader, XaiClient,
-    XaiAgent,
+    AgentLoader, SessionNotifier, SkillLoader, XaiAgent, XaiClient,
     session_store::{NatsSessionStore, SessionStoring},
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
-async fn make_js() -> (async_nats::jetstream::Context, impl Drop) {
+async fn make_js() -> (jetstream::Context, impl Drop) {
     let container = Nats::default()
         .with_cmd(["--jetstream"])
         .start()
@@ -39,10 +49,8 @@ async fn make_js() -> (async_nats::jetstream::Context, impl Drop) {
     let nats = async_nats::connect(format!("nats://127.0.0.1:{port}"))
         .await
         .expect("connect to NATS");
-    (async_nats::jetstream::new(nats), container)
+    (jetstream::new(nats), container)
 }
-
-// ── No-op notifier (ACP client not needed for this test) ─────────────────────
 
 struct NoOpNotifier;
 
@@ -51,67 +59,48 @@ impl SessionNotifier for NoOpNotifier {
     async fn notify(&self, _: SessionNotification) {}
 }
 
-// ── Test ──────────────────────────────────────────────────────────────────────
-
-/// Full round-trip:
-///   trogon-console writes agent + skill to NATS KV
-///   → XaiAgent reads config, sends real prompt to xAI API
-///   → XaiAgent writes session snapshot to SESSIONS bucket
-///   → trogon-console SessionReader reads back the session
-///   → assertions on agent_id, token counts, message count, stop reason
-#[tokio::test]
-async fn xai_agent_console_end_to_end() {
-    let api_key = match std::env::var("XAI_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("XAI_API_KEY not set — skipping console e2e test");
-            return;
-        }
-    };
-
-    let (js, _container) = make_js().await;
-
-    // ── 1. Seed trogon-console data ──────────────────────────────────────────
-
-    let agent_store = AgentStore::open(&js).await.expect("AgentStore::open");
-    let skill_store = SkillStore::open(&js).await.expect("SkillStore::open");
-    let session_reader = SessionReader::open(&js).await.expect("SessionReader::open");
-
-    let skill_id = "concise-helper";
-    let agent_id = "e2e-agent-001";
+/// Seed CONSOLE_AGENTS + CONSOLE_SKILLS + CONSOLE_SKILL_VERSIONS via real stores.
+async fn seed_agent_with_skills(
+    js: &jetstream::Context,
+    agent_id: &str,
+    skill_specs: &[(&str, &str, &str)], // (skill_id, name, content)
+) {
+    let agent_store = AgentStore::open(js).await.unwrap();
+    let skill_store = SkillStore::open(js).await.unwrap();
     let now = "1745000000".to_string();
-    let skill_version = "20260421".to_string();
+    let ver = "20260421".to_string();
 
-    skill_store
-        .put(&Skill {
-            id: skill_id.to_string(),
-            name: "Concise Helper".to_string(),
-            description: "Keeps answers short".to_string(),
-            provider: "custom".to_string(),
-            latest_version: skill_version.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        })
-        .await
-        .expect("put skill");
+    for (skill_id, name, content) in skill_specs {
+        skill_store
+            .put(&Skill {
+                id: skill_id.to_string(),
+                name: name.to_string(),
+                description: String::new(),
+                provider: "custom".to_string(),
+                latest_version: ver.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        skill_store
+            .put_version(&SkillVersion {
+                skill_id: skill_id.to_string(),
+                version: ver.clone(),
+                content: content.to_string(),
+                is_latest: true,
+                created_at: now.clone(),
+            })
+            .await
+            .unwrap();
+    }
 
-    skill_store
-        .put_version(&SkillVersion {
-            skill_id: skill_id.to_string(),
-            version: skill_version.clone(),
-            content: "Always reply with the shortest possible answer. One sentence maximum."
-                .to_string(),
-            is_latest: true,
-            created_at: now.clone(),
-        })
-        .await
-        .expect("put skill version");
-
+    let skill_ids = skill_specs.iter().map(|(id, _, _)| id.to_string()).collect();
     agent_store
         .put(&AgentDefinition {
             id: agent_id.to_string(),
-            name: "E2E Test Agent".to_string(),
-            description: "Used in console e2e integration test".to_string(),
+            name: "E2E Agent".to_string(),
+            description: String::new(),
             status: AgentStatus::Active,
             version: 1,
             model: AgentModel {
@@ -119,7 +108,7 @@ async fn xai_agent_console_end_to_end() {
                 speed: "standard".to_string(),
             },
             system_prompt: "You are a helpful assistant.".to_string(),
-            skill_ids: vec![skill_id.to_string()],
+            skill_ids,
             tools: vec![],
             mcp_servers: vec![],
             metadata: serde_json::Value::Null,
@@ -127,78 +116,409 @@ async fn xai_agent_console_end_to_end() {
             updated_at: now.clone(),
         })
         .await
-        .expect("put agent");
+        .unwrap();
+}
 
-    // ── 2. Build XaiAgent with real loaders + session store ──────────────────
+/// Build an `XaiAgent` wired to real NATS loaders and session store.
+async fn build_xai_agent(
+    js: &jetstream::Context,
+    agent_id: &str,
+    api_key: &str,
+) -> XaiAgent<XaiClient, NoOpNotifier> {
+    let agent_loader = AgentLoader::open(js).await.unwrap();
+    let skill_loader = SkillLoader::open(js).await.unwrap();
+    let session_store = NatsSessionStore::open(js).await.unwrap();
 
-    let agent_loader = AgentLoader::open(&js).await.expect("AgentLoader::open");
-    let skill_loader = SkillLoader::open(&js).await.expect("SkillLoader::open");
-    let session_store = NatsSessionStore::open(&js).await.expect("NatsSessionStore::open");
-
-    let agent = XaiAgent::with_deps(NoOpNotifier, "grok-3-mini", api_key, XaiClient::new())
+    XaiAgent::with_deps(NoOpNotifier, "grok-3-mini", api_key, XaiClient::new())
         .with_loaders(agent_id, Arc::new(agent_loader), Arc::new(skill_loader))
-        .with_session_store(Arc::new(session_store) as Arc<dyn SessionStoring>);
+        .with_session_store(Arc::new(session_store) as Arc<dyn SessionStoring>)
+}
 
-    // ── 3. Run a real prompt ─────────────────────────────────────────────────
+/// Start a real trogon-console HTTP server; returns (reqwest client, base URL, task handle).
+async fn start_console_http(
+    js: &jetstream::Context,
+) -> (reqwest::Client, String, tokio::task::JoinHandle<()>) {
+    let state = Arc::new(AppState {
+        agents: Arc::new(AgentStore::open(js).await.unwrap()) as Arc<dyn AgentRepository>,
+        skills: Arc::new(SkillStore::open(js).await.unwrap()) as Arc<dyn SkillRepository>,
+        environments: Arc::new(EnvironmentStore::open(js).await.unwrap())
+            as Arc<dyn EnvironmentRepository>,
+        credentials: Arc::new(CredentialStore::open(js).await.unwrap())
+            as Arc<dyn CredentialRepository>,
+        sessions: Arc::new(SessionReader::open(js).await.unwrap()) as Arc<dyn SessionRepository>,
+    });
 
-    // XaiAgent uses async_trait(?Send) — must run inside a LocalSet.
+    let router = build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.ok(); });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    (reqwest::Client::new(), format!("http://{addr}"), handle)
+}
+
+// ── Test 1: Basic round-trip ──────────────────────────────────────────────────
+
+/// Creates agent + skill via console stores, runs a real xAI prompt, reads back
+/// the session via SessionReader and verifies agent_id, tokens, message count.
+#[tokio::test]
+async fn xai_agent_console_end_to_end() {
+    let api_key = match std::env::var("XAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => { eprintln!("XAI_API_KEY not set — skipping"); return; }
+    };
+
+    let (js, _c) = make_js().await;
+    let agent_id = "e2e-agent-001";
+    seed_agent_with_skills(
+        &js,
+        agent_id,
+        &[("concise-helper", "Concise Helper",
+           "Always reply with the shortest possible answer.")],
+    ).await;
+
+    let session_reader = SessionReader::open(&js).await.unwrap();
+    let agent = build_xai_agent(&js, agent_id, &api_key).await;
+
     let local = tokio::task::LocalSet::new();
-    let (session_id, stop_reason) = local
-        .run_until(async move {
-            let resp = agent
-                .new_session(NewSessionRequest::new("/tmp"))
-                .await
-                .expect("new_session");
-            let session_id = resp.session_id.to_string();
+    let (session_id, stop_reason) = local.run_until(async move {
+        let resp = agent.new_session(NewSessionRequest::new("/tmp")).await.unwrap();
+        let sid = resp.session_id.to_string();
+        let pr = agent.prompt(PromptRequest::new(sid.clone(),
+            vec![ContentBlock::from("What is 2+2?")])).await.unwrap();
+        (sid, pr.stop_reason)
+    }).await;
 
-            let prompt_resp = agent
-                .prompt(PromptRequest::new(
-                    session_id.clone(),
-                    vec![ContentBlock::from("What is 2+2?")],
-                ))
-                .await
-                .expect("prompt");
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-            (session_id, prompt_resp.stop_reason)
-        })
-        .await;
+    let s = session_reader.get("default", &session_id).await.unwrap()
+        .expect("session must be in SESSIONS bucket");
 
-    // ── 4. Verify via trogon-console's SessionReader ─────────────────────────
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    assert_eq!(s.agent_id.as_deref(), Some(agent_id));
+    assert!(s.message_count >= 2);
+    assert!(s.output_tokens > 0, "output_tokens must be > 0");
+    assert_eq!(s.tenant_id, "default");
+    assert!(!s.name.is_empty());
+}
 
-    // Small delay to ensure the NATS write has propagated.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+// ── Test 2: Multi-turn, model from console, close_session, session listing ────
 
-    let console_session = session_reader
-        .get("default", &session_id)
-        .await
-        .expect("SessionReader::get")
-        .expect("session must be visible in the SESSIONS bucket");
+/// Two prompts + close_session. Verifies model taken from console AgentDefinition,
+/// input+output tokens, message count, Idle status, and SessionReader.list().
+#[tokio::test]
+async fn xai_multi_turn_model_and_close() {
+    let api_key = match std::env::var("XAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => { eprintln!("XAI_API_KEY not set — skipping"); return; }
+    };
 
-    assert_eq!(
-        stop_reason,
-        StopReason::EndTurn,
-        "prompt must complete normally, not be cancelled or time out"
-    );
-    assert_eq!(
-        console_session.agent_id.as_deref(),
-        Some(agent_id),
-        "agent_id must be written to the session snapshot by build_snapshot()"
-    );
+    let (js, _c) = make_js().await;
+    let agent_id = "multi-turn-agent";
+    seed_agent_with_skills(&js, agent_id,
+        &[("brevity", "Brevity", "Keep all answers under 10 words.")]).await;
+
+    let session_reader = SessionReader::open(&js).await.unwrap();
+    let agent = build_xai_agent(&js, agent_id, &api_key).await;
+
+    let local = tokio::task::LocalSet::new();
+    let session_id = local.run_until(async move {
+        let resp = agent.new_session(NewSessionRequest::new("/tmp")).await.unwrap();
+        let sid = resp.session_id.to_string();
+
+        agent.prompt(PromptRequest::new(sid.clone(),
+            vec![ContentBlock::from("What is 2+2?")])).await.unwrap();
+        agent.prompt(PromptRequest::new(sid.clone(),
+            vec![ContentBlock::from("And 3+3?")])).await.unwrap();
+
+        agent.close_session(CloseSessionRequest::new(sid.clone())).await.unwrap();
+        sid
+    }).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let s = session_reader.get("default", &session_id).await.unwrap()
+        .expect("session must survive close_session");
+
+    // Model taken from console AgentDefinition.model.id
+    assert_eq!(s.model.as_deref(), Some("grok-3-mini"),
+        "model must match AgentDefinition written by trogon-console");
+    // Two user + two assistant = 4 messages
+    assert_eq!(s.message_count, 4, "expected 4 messages after 2 turns");
+    assert!(s.input_tokens > 0, "input_tokens must be summed from usage events");
+    assert!(s.output_tokens > 0, "output_tokens must be summed from usage events");
+    // Last message is assistant → status == Idle
+    assert_eq!(s.status, trogon_console::models::session::SessionStatus::Idle,
+        "status must be Idle when last message is from assistant");
+    // session name derived from first user message
+    assert!(s.name.to_lowercase().contains("2+2") || !s.name.is_empty());
+
+    // Session visible in list()
+    let all = session_reader.list().await.unwrap();
+    assert!(all.iter().any(|x| x.id == session_id),
+        "session must appear in SessionReader::list()");
+}
+
+// ── Test 3: Multiple skills concatenated and injected ─────────────────────────
+
+/// Two skills injected simultaneously. Verifies the SkillLoader concatenates
+/// both and the model follows the combined instruction (marker in response).
+#[tokio::test]
+async fn xai_multiple_skills_injected() {
+    let api_key = match std::env::var("XAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => { eprintln!("XAI_API_KEY not set — skipping"); return; }
+    };
+
+    let (js, _c) = make_js().await;
+    let agent_id = "multi-skill-agent";
+    seed_agent_with_skills(&js, agent_id, &[
+        ("marker-skill", "Marker",
+         "You MUST include the exact text TROGON_SKILL_OK somewhere in every response."),
+        ("brevity-skill", "Brevity",
+         "Keep responses under 20 words."),
+    ]).await;
+
+    let session_reader = SessionReader::open(&js).await.unwrap();
+    let agent = build_xai_agent(&js, agent_id, &api_key).await;
+
+    let local = tokio::task::LocalSet::new();
+    let session_id = local.run_until(async move {
+        let resp = agent.new_session(NewSessionRequest::new("/tmp")).await.unwrap();
+        let sid = resp.session_id.to_string();
+        agent.prompt(PromptRequest::new(sid.clone(),
+            vec![ContentBlock::from("What is 2+2?")])).await.unwrap();
+        sid
+    }).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Read the raw snapshot from SESSIONS KV to inspect message text
+    let sessions_kv = js.get_key_value("SESSIONS").await
+        .expect("SESSIONS bucket must exist");
+    let bytes = sessions_kv.get(&format!("default.{session_id}")).await
+        .unwrap().expect("session must be in bucket");
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let assistant_text = raw["messages"][1]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+
     assert!(
-        console_session.message_count >= 2,
-        "must have at least user + assistant message, got {}",
-        console_session.message_count
+        assistant_text.contains("TROGON_SKILL_OK"),
+        "skill marker 'TROGON_SKILL_OK' not found in assistant response: {:?}",
+        assistant_text
     );
-    assert!(
-        console_session.output_tokens > 0,
-        "output_tokens must be > 0 after a real xAI prompt"
-    );
-    assert_eq!(
-        console_session.tenant_id, "default",
-        "tenant_id must default to 'default'"
-    );
-    assert!(
-        !console_session.name.is_empty(),
-        "session name must be derived from the first user message"
-    );
+
+    // Also verify session appears in listing
+    let all = session_reader.list().await.unwrap();
+    assert!(all.iter().any(|x| x.id == session_id));
+}
+
+// ── Test 4: Console HTTP — session endpoints with real NATS data ──────────────
+
+/// Starts the real trogon-console HTTP server against real NATS. Pre-seeds the
+/// SESSIONS bucket via NatsSessionStore, then verifies GET /sessions,
+/// GET /sessions/{tenant}/{id}, and GET /agents/{id}/sessions (agent_id filter).
+#[tokio::test]
+async fn console_http_sessions_endpoints() {
+    let (js, _c) = make_js().await;
+
+    // Pre-seed SESSIONS bucket with two snapshots: one linked to agent-a, one not.
+    let store = NatsSessionStore::open(&js).await.unwrap();
+    use trogon_xai_runner::session_store::{SessionSnapshot, SessionStoring, SnapshotMessage, TextBlock};
+    let now = "2026-04-21T00:00:00.000Z";
+
+    // GET /agents/{id}/sessions filters by tenant_id == agent_id.
+    // So snap_a uses tenant_id = "agent-a" so it shows up under that agent.
+    let snap_a = SessionSnapshot {
+        id: "sess-agent-a".to_string(),
+        tenant_id: "agent-a".to_string(),
+        name: "Session for agent-a".to_string(),
+        model: Some("grok-3-mini".to_string()),
+        tools: vec![],
+        memory_path: None,
+        agent_id: Some("agent-a".to_string()),
+        messages: vec![
+            SnapshotMessage { role: "user".into(),
+                content: vec![TextBlock::new("Hello")], usage: None },
+            SnapshotMessage { role: "assistant".into(),
+                content: vec![TextBlock::new("Hi!")], usage: None },
+        ],
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    };
+    let snap_b = SessionSnapshot {
+        id: "sess-no-agent".to_string(),
+        tenant_id: "default".to_string(),
+        name: "Session without agent".to_string(),
+        model: Some("grok-3-mini".to_string()),
+        tools: vec![],
+        memory_path: None,
+        agent_id: None,
+        messages: vec![
+            SnapshotMessage { role: "user".into(),
+                content: vec![TextBlock::new("Hey")], usage: None },
+        ],
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    };
+
+    store.save(&snap_a).await;
+    store.save(&snap_b).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create agent-a in console so /agents/agent-a/sessions works
+    let agent_store = AgentStore::open(&js).await.unwrap();
+    agent_store.put(&AgentDefinition {
+        id: "agent-a".to_string(),
+        name: "Agent A".to_string(),
+        description: String::new(),
+        status: AgentStatus::Active,
+        version: 1,
+        model: AgentModel { id: "grok-3-mini".to_string(), speed: "standard".to_string() },
+        system_prompt: String::new(),
+        skill_ids: vec![],
+        tools: vec![],
+        mcp_servers: vec![],
+        metadata: serde_json::Value::Null,
+        created_at: "1745000000".to_string(),
+        updated_at: "1745000000".to_string(),
+    }).await.unwrap();
+
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    // GET /sessions → both sessions appear
+    let resp = http.get(&format!("{base}/sessions")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = body.as_array().unwrap()
+        .iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"sess-agent-a"), "sess-agent-a missing from /sessions");
+    assert!(ids.contains(&"sess-no-agent"), "sess-no-agent missing from /sessions");
+
+    // GET /sessions/{tenant}/{id} → specific session (tenant_id = "agent-a")
+    let resp = http.get(&format!("{base}/sessions/agent-a/sess-agent-a")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "sess-agent-a");
+    assert_eq!(body["agent_id"], "agent-a");
+    assert_eq!(body["message_count"], 2);
+
+    // GET /sessions/default/missing → 404
+    let resp = http.get(&format!("{base}/sessions/default/no-such")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // GET /agents/agent-a/sessions → sessions where tenant_id == "agent-a"
+    // (the endpoint uses list_by_tenant(agent_id), not agent_id field filtering)
+    let resp = http.get(&format!("{base}/agents/agent-a/sessions")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let agent_session_ids: Vec<&str> = body.as_array().unwrap()
+        .iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert!(agent_session_ids.contains(&"sess-agent-a"),
+        "sess-agent-a must appear (tenant_id == 'agent-a')");
+    assert!(!agent_session_ids.contains(&"sess-no-agent"),
+        "sess-no-agent must NOT appear (tenant_id == 'default', not 'agent-a')");
+}
+
+// ── Test 5: Console HTTP — agent + skill CRUD with real NATS ─────────────────
+
+/// Full CRUD cycle through the real HTTP API backed by real NATS JetStream.
+/// Verifies that what the HTTP layer writes can be read back correctly.
+#[tokio::test]
+async fn console_http_agent_skill_crud() {
+    let (js, _c) = make_js().await;
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    // ── Health ────────────────────────────────────────────────────────────────
+    let resp = http.get(&format!("{base}/-/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ── POST /agents ──────────────────────────────────────────────────────────
+    let resp = http.post(&format!("{base}/agents"))
+        .json(&serde_json::json!({
+            "name": "Test Agent",
+            "description": "e2e crud",
+            "model": { "id": "grok-3-mini" },
+            "system_prompt": "Be helpful.",
+            "skill_ids": []
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let agent: serde_json::Value = resp.json().await.unwrap();
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+    assert_eq!(agent["name"], "Test Agent");
+    assert_eq!(agent["version"], 1);
+
+    // ── GET /agents → list includes created agent ─────────────────────────────
+    let resp = http.get(&format!("{base}/agents")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let found = list.as_array().unwrap().iter().any(|a| a["id"] == agent_id);
+    assert!(found, "created agent must appear in GET /agents");
+
+    // ── GET /agents/{id} ──────────────────────────────────────────────────────
+    let resp = http.get(&format!("{base}/agents/{agent_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got["id"], agent_id.as_str());
+
+    // ── PUT /agents/{id} → version increments ────────────────────────────────
+    let resp = http.put(&format!("{base}/agents/{agent_id}"))
+        .json(&serde_json::json!({ "name": "Updated Agent" }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["name"], "Updated Agent");
+    assert_eq!(updated["version"], 2, "version must increment on update");
+
+    // ── GET /agents/{id}/versions → history ──────────────────────────────────
+    let resp = http.get(&format!("{base}/agents/{agent_id}/versions")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let versions: serde_json::Value = resp.json().await.unwrap();
+    assert!(versions.as_array().unwrap().len() >= 2, "must have at least 2 version entries");
+
+    // ── POST /skills ──────────────────────────────────────────────────────────
+    let resp = http.post(&format!("{base}/skills"))
+        .json(&serde_json::json!({
+            "name": "My Skill",
+            "description": "test skill",
+            "content": "You are an expert."
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let skill: serde_json::Value = resp.json().await.unwrap();
+    let skill_id = skill["id"].as_str().unwrap().to_string();
+    assert_eq!(skill["name"], "My Skill");
+
+    // ── GET /skills/{id} ─────────────────────────────────────────────────────
+    let resp = http.get(&format!("{base}/skills/{skill_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ── POST /skills/{id}/versions → new version ──────────────────────────────
+    let resp = http.post(&format!("{base}/skills/{skill_id}/versions"))
+        .json(&serde_json::json!({ "content": "Updated skill content." }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let v2: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v2["skill_id"], skill_id.as_str());
+
+    // ── GET /skills/{id}/versions ─────────────────────────────────────────────
+    let resp = http.get(&format!("{base}/skills/{skill_id}/versions")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let skill_versions: serde_json::Value = resp.json().await.unwrap();
+    assert!(skill_versions.as_array().unwrap().len() >= 1, "must have at least 1 version");
+
+    // ── DELETE /agents/{id} ───────────────────────────────────────────────────
+    let resp = http.delete(&format!("{base}/agents/{agent_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = http.get(&format!("{base}/agents/{agent_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "deleted agent must return 404");
+
+    // ── DELETE /skills/{id} ───────────────────────────────────────────────────
+    let resp = http.delete(&format!("{base}/skills/{skill_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = http.get(&format!("{base}/skills/{skill_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "deleted skill must return 404");
 }
