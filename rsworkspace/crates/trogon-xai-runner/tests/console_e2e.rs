@@ -329,11 +329,10 @@ async fn console_http_sessions_endpoints() {
     use trogon_xai_runner::session_store::{SessionSnapshot, SessionStoring, SnapshotMessage, TextBlock};
     let now = "2026-04-21T00:00:00.000Z";
 
-    // GET /agents/{id}/sessions filters by tenant_id == agent_id.
-    // So snap_a uses tenant_id = "agent-a" so it shows up under that agent.
+    // snap_a: belongs to agent-a via agent_id field; tenant_id is independent.
     let snap_a = SessionSnapshot {
         id: "sess-agent-a".to_string(),
-        tenant_id: "agent-a".to_string(),
+        tenant_id: "default".to_string(),
         name: "Session for agent-a".to_string(),
         model: Some("grok-3-mini".to_string()),
         tools: vec![],
@@ -397,8 +396,8 @@ async fn console_http_sessions_endpoints() {
     assert!(ids.contains(&"sess-agent-a"), "sess-agent-a missing from /sessions");
     assert!(ids.contains(&"sess-no-agent"), "sess-no-agent missing from /sessions");
 
-    // GET /sessions/{tenant}/{id} → specific session (tenant_id = "agent-a")
-    let resp = http.get(&format!("{base}/sessions/agent-a/sess-agent-a")).send().await.unwrap();
+    // GET /sessions/{tenant}/{id} → specific session (tenant_id = "default")
+    let resp = http.get(&format!("{base}/sessions/default/sess-agent-a")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["id"], "sess-agent-a");
@@ -409,17 +408,16 @@ async fn console_http_sessions_endpoints() {
     let resp = http.get(&format!("{base}/sessions/default/no-such")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 
-    // GET /agents/agent-a/sessions → sessions where tenant_id == "agent-a"
-    // (the endpoint uses list_by_tenant(agent_id), not agent_id field filtering)
+    // GET /agents/agent-a/sessions → filters by agent_id field, not tenant_id
     let resp = http.get(&format!("{base}/agents/agent-a/sessions")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let agent_session_ids: Vec<&str> = body.as_array().unwrap()
         .iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert!(agent_session_ids.contains(&"sess-agent-a"),
-        "sess-agent-a must appear (tenant_id == 'agent-a')");
+        "sess-agent-a must appear (agent_id == 'agent-a')");
     assert!(!agent_session_ids.contains(&"sess-no-agent"),
-        "sess-no-agent must NOT appear (tenant_id == 'default', not 'agent-a')");
+        "sess-no-agent must NOT appear (agent_id is None)");
 }
 
 // ── Test 5: Console HTTP — agent + skill CRUD with real NATS ─────────────────
