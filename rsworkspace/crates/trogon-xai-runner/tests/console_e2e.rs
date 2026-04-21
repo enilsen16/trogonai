@@ -516,9 +516,214 @@ async fn console_http_agent_skill_crud() {
     let resp = http.get(&format!("{base}/agents/{agent_id}")).send().await.unwrap();
     assert_eq!(resp.status(), 404, "deleted agent must return 404");
 
+    // ── GET /skills (list) ────────────────────────────────────────────────────
+    let resp = http.get(&format!("{base}/skills")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert!(list.as_array().unwrap().iter().any(|s| s["id"] == skill_id.as_str()),
+        "skill must appear in GET /skills list");
+
     // ── DELETE /skills/{id} ───────────────────────────────────────────────────
     let resp = http.delete(&format!("{base}/skills/{skill_id}")).send().await.unwrap();
     assert_eq!(resp.status(), 204);
     let resp = http.get(&format!("{base}/skills/{skill_id}")).send().await.unwrap();
     assert_eq!(resp.status(), 404, "deleted skill must return 404");
+}
+
+// ── Test 6: Environments CRUD with real NATS ──────────────────────────────────
+
+#[tokio::test]
+async fn console_http_environments_crud() {
+    let (js, _c) = make_js().await;
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    // POST /environments
+    let resp = http.post(&format!("{base}/environments"))
+        .json(&serde_json::json!({
+            "name": "Prod Cloud",
+            "description": "production env",
+            "type": "cloud",
+            "networking": "unrestricted",
+            "packages": [{ "manager": "pip", "spec": "requests==2.31.0" }]
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let env: serde_json::Value = resp.json().await.unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+    assert_eq!(env["name"], "Prod Cloud");
+    assert_eq!(env["type"], "cloud");
+    assert_eq!(env["archived"], false);
+
+    // GET /environments → list includes it
+    let resp = http.get(&format!("{base}/environments")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert!(list.as_array().unwrap().iter().any(|e| e["id"] == env_id.as_str()));
+
+    // GET /environments/{id}
+    let resp = http.get(&format!("{base}/environments/{env_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got["id"], env_id.as_str());
+    assert_eq!(got["packages"][0]["manager"], "pip");
+
+    // PUT /environments/{id} → update name and networking
+    let resp = http.put(&format!("{base}/environments/{env_id}"))
+        .json(&serde_json::json!({ "name": "Prod Cloud Updated", "networking": "restricted" }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["name"], "Prod Cloud Updated");
+    assert_eq!(updated["networking"], "restricted");
+
+    // POST /environments/{id}/archive
+    let resp = http.post(&format!("{base}/environments/{env_id}/archive"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let archived: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(archived["archived"], true, "archived flag must be true after archive");
+
+    // DELETE /environments/{id}
+    let resp = http.delete(&format!("{base}/environments/{env_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = http.get(&format!("{base}/environments/{env_id}")).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "deleted environment must return 404");
+}
+
+// ── Test 7: Credentials + Vaults with real NATS ───────────────────────────────
+
+#[tokio::test]
+async fn console_http_credentials_and_vaults() {
+    let (js, _c) = make_js().await;
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    // Create an environment first (credentials belong to environments)
+    let resp = http.post(&format!("{base}/environments"))
+        .json(&serde_json::json!({ "name": "Cred Env", "description": "" }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let env: serde_json::Value = resp.json().await.unwrap();
+    let env_id = env["id"].as_str().unwrap().to_string();
+
+    // GET /environments/{id}/vault → auto-created on first credential
+    // (vault doesn't exist yet — expect 404)
+    let resp = http.get(&format!("{base}/environments/{env_id}/vault")).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "vault must not exist before first credential");
+
+    // POST /environments/{id}/credentials → auto-creates vault
+    let resp = http.post(&format!("{base}/environments/{env_id}/credentials"))
+        .json(&serde_json::json!({
+            "name": "GitHub Token",
+            "type": "bearer_token",
+            "mcp_server_url": "https://mcp.github.com/mcp"
+        }))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let cred: serde_json::Value = resp.json().await.unwrap();
+    let cred_id = cred["id"].as_str().unwrap().to_string();
+    assert_eq!(cred["name"], "GitHub Token");
+    assert_eq!(cred["type"], "bearer_token");
+    assert_eq!(cred["status"], "active");
+
+    // GET /environments/{id}/vault → now exists
+    let resp = http.get(&format!("{base}/environments/{env_id}/vault")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let vault: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(vault["env_id"], env_id.as_str());
+
+    // GET /environments/{id}/credentials → list includes the credential
+    let resp = http.get(&format!("{base}/environments/{env_id}/credentials")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let creds: serde_json::Value = resp.json().await.unwrap();
+    assert!(creds.as_array().unwrap().iter().any(|c| c["id"] == cred_id.as_str()));
+
+    // GET /environments/{id}/credentials/{cred_id}
+    let resp = http.get(&format!("{base}/environments/{env_id}/credentials/{cred_id}"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got["id"], cred_id.as_str());
+    assert_eq!(got["mcp_server_url"], "https://mcp.github.com/mcp");
+
+    // DELETE /environments/{id}/credentials/{cred_id}
+    let resp = http.delete(&format!("{base}/environments/{env_id}/credentials/{cred_id}"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = http.get(&format!("{base}/environments/{env_id}/credentials/{cred_id}"))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 404, "deleted credential must return 404");
+}
+
+// ── Test 8: MCP Registry ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn console_http_mcp_registry() {
+    let (js, _c) = make_js().await;
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    let resp = http.get(&format!("{base}/mcp-registry")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let servers = list.as_array().unwrap();
+
+    assert_eq!(servers.len(), 10, "must return all 10 known MCP servers");
+
+    let names: Vec<&str> = servers.iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"GitHub"));
+    assert!(names.contains(&"Slack"));
+    assert!(names.contains(&"Linear"));
+
+    // Every entry must have a non-empty url
+    for s in servers {
+        assert!(s["url"].as_str().unwrap_or("").starts_with("https://"),
+            "MCP server url must be https: {:?}", s["url"]);
+    }
+}
+
+// ── Test 9: Session status=Running ───────────────────────────────────────────
+
+/// Seeds a session whose last message is from `user` (simulates a cancelled or
+/// in-progress turn) and verifies trogon-console derives status=Running.
+#[tokio::test]
+async fn console_session_status_running() {
+    let (js, _c) = make_js().await;
+
+    let store = NatsSessionStore::open(&js).await.unwrap();
+    use trogon_xai_runner::session_store::{SessionSnapshot, SessionStoring, SnapshotMessage, TextBlock};
+    let now = "2026-04-21T00:00:00.000Z";
+
+    // Last message is "user" → status must be Running
+    store.save(&SessionSnapshot {
+        id: "sess-running".to_string(),
+        tenant_id: "default".to_string(),
+        name: "Pending session".to_string(),
+        model: Some("grok-3-mini".to_string()),
+        tools: vec![],
+        memory_path: None,
+        agent_id: None,
+        messages: vec![
+            SnapshotMessage { role: "user".into(),
+                content: vec![TextBlock::new("Hello")], usage: None },
+            SnapshotMessage { role: "assistant".into(),
+                content: vec![TextBlock::new("Hi!")], usage: None },
+            SnapshotMessage { role: "user".into(),
+                content: vec![TextBlock::new("Follow-up question")], usage: None },
+        ],
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    }).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (http, base, _handle) = start_console_http(&js).await;
+
+    let resp = http.get(&format!("{base}/sessions/default/sess-running")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["status"], "running",
+        "status must be 'running' when last message role is 'user'");
+    assert_eq!(body["message_count"], 3);
 }
