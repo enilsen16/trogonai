@@ -315,4 +315,57 @@ mod tests {
             assert_eq!(config.prompt_timeout(), Duration::from_secs(3600));
         });
     }
+
+    /// `char::is_whitespace()` covers Unicode whitespace (e.g. U+00A0 NO-BREAK
+    /// SPACE) in addition to ASCII whitespace.  These characters are not safe
+    /// in NATS subjects and must be rejected.
+    /// `\r` (carriage return, U+000D) is whitespace per `char::is_whitespace()`
+    /// and must be rejected with `InvalidCharacter`.
+    #[test]
+    fn acp_prefix_rejects_carriage_return() {
+        use trogon_nats::SubjectTokenViolation;
+        let err = AcpPrefix::new("acp\rfoo").err().unwrap();
+        assert!(
+            matches!(err.0, SubjectTokenViolation::InvalidCharacter('\r')),
+            "expected InvalidCharacter('\\r'), got: {:?}",
+            err
+        );
+    }
+
+    /// `\x0C` (form feed, U+000C) is whitespace per `char::is_whitespace()`
+    /// and must be rejected with `InvalidCharacter`.
+    #[test]
+    fn acp_prefix_rejects_form_feed() {
+        use trogon_nats::SubjectTokenViolation;
+        let err = AcpPrefix::new("acp\x0Cfoo").err().unwrap();
+        assert!(
+            matches!(err.0, SubjectTokenViolation::InvalidCharacter('\x0C')),
+            "expected InvalidCharacter('\\x0C'), got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn acp_prefix_rejects_unicode_whitespace() {
+        use trogon_nats::SubjectTokenViolation;
+        let err = AcpPrefix::new("acp\u{00A0}foo").err().unwrap();
+        assert!(
+            matches!(err.0, SubjectTokenViolation::InvalidCharacter('\u{00A0}')),
+            "expected InvalidCharacter with U+00A0, got: {:?}",
+            err
+        );
+    }
+
+    /// Consecutive dots (`..`) are rejected via `has_consecutive_or_boundary_dots`
+    /// and produce `AcpPrefixError(SubjectTokenViolation::InvalidCharacter('.'))`.
+    #[test]
+    fn acp_prefix_consecutive_dots_returns_invalid_character_dot() {
+        use trogon_nats::SubjectTokenViolation;
+        let err = AcpPrefix::new("acp..foo").err().unwrap();
+        assert!(
+            matches!(err.0, SubjectTokenViolation::InvalidCharacter('.')),
+            "expected InvalidCharacter('.'), got: {:?}",
+            err
+        );
+    }
 }

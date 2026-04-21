@@ -1,0 +1,160 @@
+services:
+
+  # ── NATS with JetStream enabled ───────────────────────────────────────────
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    ports:
+      - "4222:4222"   # client connections
+      - "8222:8222"   # HTTP monitoring (http://localhost:8222)
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── HTTP detokenization proxy ─────────────────────────────────────────────
+  proxy:
+    build:
+      context: .
+      target: proxy
+    ports:
+      - "8080:8080"
+    environment:
+      NATS_URL: nats://nats:4222
+      PROXY_PREFIX: trogon
+      PROXY_PORT: "8080"
+      PROXY_WORKER_TIMEOUT_SECS: "60"
+      RUST_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Vault admin / detokenization worker ───────────────────────────────────
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      NATS_URL: nats://nats:4222
+      PROXY_PREFIX: trogon
+      WORKER_CONSUMER_NAME: proxy-workers
+      RUST_LOG: info
+    env_file:
+      - path: .env
+        required: false   # optional — inject VAULT_TOKEN_* secrets here
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    # Scale horizontally: docker compose up --scale worker=3
+
+  # ── GitHub webhook receiver ───────────────────────────────────────────────
+  trogon-github:
+    build:
+      context: .
+      target: trogon-github
+    ports:
+      - "8081:8081"
+    environment:
+      NATS_URL: nats://nats:4222
+      GITHUB_WEBHOOK_PORT: "8081"
+      # GITHUB_WEBHOOK_SECRET: ""   # set to validate X-Hub-Signature-256
+      RUST_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Linear webhook receiver ───────────────────────────────────────────────
+  trogon-linear:
+    build:
+      context: .
+      target: trogon-linear
+    ports:
+      - "8082:8082"
+    environment:
+      NATS_URL: nats://nats:4222
+      LINEAR_WEBHOOK_PORT: "8082"
+      # LINEAR_WEBHOOK_SECRET: ""   # set to validate Linear signatures
+      RUST_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Datadog webhook receiver ──────────────────────────────────────────────
+  trogon-datadog:
+    build:
+      context: .
+      target: trogon-datadog
+    ports:
+      - "8083:8083"
+    environment:
+      NATS_URL: nats://nats:4222
+      DATADOG_WEBHOOK_PORT: "8083"
+      # DATADOG_WEBHOOK_SECRET: ""   # set to validate X-Datadog-Signature
+      RUST_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── incident.io webhook receiver ─────────────────────────────────────────
+  trogon-incidentio:
+    build:
+      context: .
+      target: trogon-incidentio
+    ports:
+      - "8084:8084"
+    environment:
+      NATS_URL: nats://nats:4222
+      INCIDENTIO_WEBHOOK_PORT: "8084"
+      # INCIDENTIO_WEBHOOK_SECRET: ""   # set to validate X-Incident-Signature
+      # INCIDENTIO_API_TOKEN: ""        # Bearer token for the incident.io REST API
+      RUST_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Agentic loop + automations + chat API ────────────────────────────────
+  agent:
+    build:
+      context: .
+      target: agent
+    ports:
+      - "8090:8090"
+    environment:
+      NATS_URL: nats://nats:4222
+      PROXY_URL: http://proxy:8080
+      ANTHROPIC_TOKEN: "${ANTHROPIC_TOKEN}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      LINEAR_TOKEN: "${LINEAR_TOKEN}"
+      SLACK_TOKEN: "${SLACK_TOKEN:-}"
+      TENANT_ID: "${TENANT_ID:-default}"
+      AUTOMATIONS_API_PORT: "8090"
+      RUST_LOG: info
+      # Optional overrides:
+      # AGENT_MODEL: claude-opus-4-6
+      # AGENT_MAX_ITERATIONS: "10"
+      # MEMORY_OWNER: my-org
+      # MEMORY_REPO: my-repo
+      # MEMORY_PATH: .trogon/memory.md
+      # INCIDENTIO_STREAM_NAME: INCIDENTIO
+    depends_on:
+      nats:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  nats-data:

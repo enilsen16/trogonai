@@ -82,7 +82,10 @@ fn auth_from_env<E: ReadEnv>(env: &E) -> NatsAuth {
     if let Ok(nkey) = env.var(ENV_NATS_NKEY) {
         return NatsAuth::NKey(nkey);
     }
-    if let (Ok(user), Ok(password)) = (env.var(ENV_NATS_USER), env.var(ENV_NATS_PASSWORD)) {
+    if let (Ok(user), Ok(password)) = (env.var(ENV_NATS_USER), env.var(ENV_NATS_PASSWORD))
+        && !user.is_empty()
+        && !password.is_empty()
+    {
         return NatsAuth::UserPassword { user, password };
     }
     if let Ok(token) = env.var(ENV_NATS_TOKEN) {
@@ -173,10 +176,13 @@ mod tests {
         assert!(matches!(NatsConfig::from_env(&env).auth, NatsAuth::None));
     }
 
+    /// Only `NATS_PASSWORD` set (no `NATS_USER`) must also fall through to
+    /// `NatsAuth::None` — both halves of the tuple pattern must succeed.
     #[test]
     fn from_env_requires_both_user_and_password_only_password_set() {
         let env = InMemoryEnv::new();
         env.set("NATS_PASSWORD", "pass");
+        // no NATS_USER
 
         assert!(matches!(NatsConfig::from_env(&env).auth, NatsAuth::None));
     }
@@ -187,6 +193,141 @@ mod tests {
 
         assert_eq!(config.servers, vec!["nats://custom:4222"]);
         assert!(matches!(config.auth, NatsAuth::None));
+    }
+
+    /// `NatsConfig::new()` stores the given servers and auth as-is.
+    #[test]
+    fn new_stores_servers_and_auth() {
+        let servers = vec!["host1:4222".to_string(), "host2:4222".to_string()];
+        let config = NatsConfig::new(servers.clone(), NatsAuth::Token("tok".into()));
+
+        assert_eq!(config.servers, servers);
+        assert!(matches!(config.auth, NatsAuth::Token(t) if t == "tok"));
+    }
+
+    /// `NatsConfig::new()` with empty server list preserves the empty list
+    /// (callers are responsible for validation before connecting).
+    #[test]
+    fn new_with_empty_servers() {
+        let config = NatsConfig::new(vec![], NatsAuth::None);
+        assert!(config.servers.is_empty());
+    }
+
+    /// `from_url("")` wraps the empty string directly in the server list —
+    /// it does NOT apply the trim+filter that `from_env` does.
+    /// This asymmetry is intentional: `from_url` is a direct constructor.
+    #[test]
+    fn from_url_empty_string_preserves_empty_entry() {
+        let config = NatsConfig::from_url("");
+
+        assert_eq!(
+            config.servers,
+            vec!["".to_string()],
+            "from_url stores the value verbatim, unlike from_env which filters empty segments"
+        );
+    }
+
+    // ── servers_from_env edge cases ───────────────────────────────────────────
+
+    /// NATS_URL set to whitespace-only entries (e.g. "  ,  ,  ") produces an
+    /// EMPTY server list — NOT the default `localhost:4222`.
+    /// The default is only used when the env var is absent.
+    #[test]
+    fn servers_from_env_whitespace_only_nats_url_produces_empty_vec() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "  ,  ,  ");
+        let config = NatsConfig::from_env(&env);
+        assert!(
+            config.servers.is_empty(),
+            "whitespace-only NATS_URL must produce an empty server list, got: {:?}",
+            config.servers
+        );
+    }
+
+    /// A trailing comma in NATS_URL is silently ignored — the empty segment
+    /// is filtered out and only the valid host remains.
+    #[test]
+    fn servers_from_env_trailing_comma_ignored() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "host1:4222,");
+        let config = NatsConfig::from_env(&env);
+        assert_eq!(config.servers, vec!["host1:4222"]);
+    }
+
+    /// A single-entry NATS_URL with surrounding whitespace is trimmed correctly.
+    #[test]
+    fn servers_from_env_single_entry_with_spaces() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "  nats://host:4222  ");
+        let config = NatsConfig::from_env(&env);
+        assert_eq!(config.servers, vec!["nats://host:4222"]);
+    }
+
+    /// A whitespace-only segment in the middle of a comma-separated NATS_URL
+    /// is trimmed to an empty string and filtered out, so only the valid
+    /// hosts on either side survive.
+    #[test]
+    fn servers_from_env_middle_whitespace_only_segment_is_filtered() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "host1:4222, ,host2:4222");
+        let config = NatsConfig::from_env(&env);
+        assert_eq!(config.servers, vec!["host1:4222", "host2:4222"]);
+    }
+
+    /// A double comma in NATS_URL (e.g. `"host1,,host2"`) produces an empty
+    /// segment after splitting on `,`; the trim+filter chain must discard it
+    /// so only the two valid hosts survive.
+    #[test]
+    fn servers_from_env_double_comma_filters_empty_segment() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "host1:4222,,host2:4222");
+        let config = NatsConfig::from_env(&env);
+        assert_eq!(config.servers, vec!["host1:4222", "host2:4222"]);
+    }
+
+    /// An explicit empty string for `NATS_URL` also results in an empty list.
+    #[test]
+    fn from_env_nats_url_empty_string_produces_empty_servers() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_URL", "");
+        let config = NatsConfig::from_env(&env);
+        assert!(
+            config.servers.is_empty(),
+            "empty NATS_URL should produce an empty server list; got {:?}",
+            config.servers
+        );
+    }
+
+    /// `NATS_PASSWORD=""` (present but empty) must fall through to `None` —
+    /// an empty password is treated the same as an absent one so that
+    /// misconfigured deployments fail at connection time with a clear
+    /// "no auth configured" message rather than a confusing NATS auth error.
+    #[test]
+    fn auth_from_env_empty_password_falls_through_to_none() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_USER", "alice");
+        env.set("NATS_PASSWORD", "");
+
+        let auth = NatsConfig::from_env(&env).auth;
+        assert!(
+            matches!(auth, NatsAuth::None),
+            "empty NATS_PASSWORD must fall through to NatsAuth::None, got: {auth:?}"
+        );
+    }
+
+    /// `NATS_USER=""` (present but empty) must also fall through — an empty
+    /// user is equally a misconfiguration.
+    #[test]
+    fn auth_from_env_empty_user_falls_through_to_none() {
+        let env = InMemoryEnv::new();
+        env.set("NATS_USER", "");
+        env.set("NATS_PASSWORD", "secret");
+
+        let auth = NatsConfig::from_env(&env).auth;
+        assert!(
+            matches!(auth, NatsAuth::None),
+            "empty NATS_USER must fall through to NatsAuth::None, got: {auth:?}"
+        );
     }
 
     #[test]
