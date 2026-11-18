@@ -243,7 +243,14 @@ async fn connect_as_caller(
     // stalled servers would otherwise hold the caller for a multiple of it.
     tokio::time::timeout(
         timeout.get(),
-        trogon_nats::connect_once(nats, NatsAuth::Token(token), timeout.get()),
+        trogon_nats::connect_once(
+            nats,
+            NatsAuth::UserPassword {
+                user: std::env::var("BRIDGE_TENANT_ACCOUNT").unwrap_or_default(),
+                password: token,
+            },
+            timeout.get(),
+        ),
     )
     .await
     .map_err(|_| CallerConnectError::TimedOut(timeout.get()))?
