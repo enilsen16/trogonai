@@ -238,19 +238,19 @@ async fn connect_as_caller(
     caller_jwt: &BridgeUserJwt,
     timeout: CallerConnectTimeout,
 ) -> Result<async_nats::Client, CallerConnectError> {
-    let token = CredentialValue::Literal(SecretString::new(caller_jwt.as_str())?);
+    let jwt = CredentialValue::Literal(SecretString::new(caller_jwt.as_str())?);
+    let auth = match caller_jwt.seed() {
+        Some(seed) => NatsAuth::Jwt {
+            jwt,
+            seed: Some(CredentialValue::Literal(SecretString::new(seed)?)),
+        },
+        None => NatsAuth::Token(jwt),
+    };
     // connect_once applies its timeout to each server in turn, so a list of
     // stalled servers would otherwise hold the caller for a multiple of it.
     tokio::time::timeout(
         timeout.get(),
-        trogon_nats::connect_once(
-            nats,
-            NatsAuth::UserPassword {
-                user: std::env::var("BRIDGE_TENANT_ACCOUNT").unwrap_or_default(),
-                password: token,
-            },
-            timeout.get(),
-        ),
+        trogon_nats::connect_once(nats, auth, timeout.get()),
     )
     .await
     .map_err(|_| CallerConnectError::TimedOut(timeout.get()))?

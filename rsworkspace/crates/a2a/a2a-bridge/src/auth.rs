@@ -162,8 +162,10 @@ impl<W: AuthMintWire + 'static> AuthCalloutJsonMintClient<W> {
 #[async_trait]
 impl<W: AuthMintWire + 'static> AuthCalloutClient for AuthCalloutJsonMintClient<W> {
     async fn mint(&self, caller_auth: &CallerHttpsAuth) -> Result<BridgeUserJwt, BridgeError> {
+        let user_key = nkeys::KeyPair::new_user();
         let envelope = BridgeMintRequest {
             account: self.tenant_account.as_ref().map(|a| a.as_str().to_owned()),
+            user_nkey: Some(user_key.public_key()),
             sealed_credential: Some(self.sealed_credential(caller_auth)?),
             ..BridgeMintRequest::default()
         };
@@ -180,7 +182,10 @@ impl<W: AuthMintWire + 'static> AuthCalloutClient for AuthCalloutJsonMintClient<
         let reply: BridgeMintReply =
             serde_json::from_slice(&reply).map_err(|e: serde_json::Error| BridgeError::Deserialize(e))?;
         match reply {
-            BridgeMintReply::Minted(response) => BridgeUserJwt::new(response.user_jwt),
+            BridgeMintReply::Minted(response) => {
+                let seed = user_key.seed().map_err(|e| BridgeError::Mint(e.to_string()))?;
+                Ok(BridgeUserJwt::new(response.user_jwt)?.with_seed(seed))
+            }
             BridgeMintReply::Refused(refusal) => Err(BridgeError::Mint(format!(
                 "auth callout refused the mint: {}",
                 refusal.refusal

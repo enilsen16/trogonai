@@ -79,7 +79,7 @@ impl fmt::Display for CallerHttpsAuth {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct BridgeUserJwt(String);
+pub struct BridgeUserJwt(String, Option<String>);
 
 impl fmt::Debug for BridgeUserJwt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,7 +103,19 @@ impl BridgeUserJwt {
                 "minted user JWT must be a compact 3-segment JWT".into(),
             ));
         }
-        Ok(Self(token))
+        Ok(Self(token, None))
+    }
+
+    /// Attach the seed of the user key this JWT was minted for, so the bridge
+    /// can sign the server's nonce when it connects as the caller.
+    #[must_use]
+    pub fn with_seed(mut self, seed: impl Into<String>) -> Self {
+        self.1 = Some(seed.into());
+        self
+    }
+
+    pub fn seed(&self) -> Option<&str> {
+        self.1.as_deref()
     }
 
     pub fn as_str(&self) -> &str {
